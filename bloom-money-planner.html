@@ -2037,6 +2037,7 @@ function addMonthEntryForEvent(ev, key){
     if(!state.debts.some(d=>d.id===debtId)) return;
     ensureDebtMonth(mi);
     state.debtSpending[pk(mi)][debtId].push({id:uid(), name:ev.label, amount:ev.amount, sourceEventId:ev.id});
+    applyDebtPayment(debtId, ev.amount); // keep the actual balance on the Debt tab in sync, same as Track a Spend does
     return;
   }
   if(ev.flowTo.startsWith('savings:')){
@@ -2044,6 +2045,7 @@ function addMonthEntryForEvent(ev, key){
     if(!state.funds.some(f=>f.id===fundId)) return;
     ensureSavingsMonth(mi);
     state.savingsSpending[pk(mi)][fundId].push({id:uid(), name:ev.label, amount:ev.amount, sourceEventId:ev.id});
+    applySavingsContribution(fundId, ev.amount); // keep the actual saved total on the Savings tab in sync, same as Track a Spend does
     return;
   }
   if(!FLOW_BUCKETS[ev.flowTo]) return;
