@@ -218,6 +218,18 @@ function setBusy(btn, busy, label){
   btn.disabled = busy;
   btn.textContent = busy ? 'Please wait…' : label;
 }
+/* try/catch alone only catches a call that throws or rejects — it does
+   nothing for a call that just hangs and never settles either way, which
+   is exactly what a stuck connection to Supabase looks like. `await` has
+   no built-in timeout, so without this, a hung request leaves the button
+   on "Please wait…" forever no matter how the rest of the code is written.
+   This races the real call against a timer and rejects if the timer wins. */
+function withTimeout(promise, ms, timeoutMessage){
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(timeoutMessage)), ms))
+  ]);
+}
 
 async function doSignin(){
   clearMessages();
@@ -228,13 +240,17 @@ async function doSignin(){
   const btn = document.getElementById('signinBtn');
   setBusy(btn, true, 'Sign in');
   try{
-    const { error } = await sb.auth.signInWithPassword({ email, password: pw });
+    const { error } = await withTimeout(
+      sb.auth.signInWithPassword({ email, password: pw }),
+      15000, 'Sign-in timed out'
+    );
     if(error){ showError(error.message); return; }
     goToPlanner();
   }catch(e){
-    // An unexpected failure here (a network hiccup, a timeout, anything other
-    // than a normal "wrong password" rejection) used to leave the button stuck
-    // on "Please wait…" forever with no feedback at all. Always show something.
+    // An unexpected failure here (a network hiccup, a hung connection,
+    // anything other than a normal "wrong password" rejection) used to leave
+    // the button stuck on "Please wait…" forever with no feedback at all.
+    // Always show something, and always let the button recover.
     showError("Something went wrong signing you in. Please check your connection and try again.");
   }finally{
     setBusy(btn, false, 'Sign in');
@@ -254,7 +270,10 @@ async function doCreate(){
   const btn = document.getElementById('createBtn');
   setBusy(btn, true, 'Create account');
   try{
-    const { data, error } = await sb.auth.signUp({ email, password: pw });
+    const { data, error } = await withTimeout(
+      sb.auth.signUp({ email, password: pw }),
+      15000, 'Sign-up timed out'
+    );
     if(error){ showError(error.message); return; }
 
     if(data.session){
@@ -285,9 +304,10 @@ async function doForgotPassword(){
   const btn = document.getElementById('forgotBtn');
   setBusy(btn, true, 'Send reset link');
   try{
-    const { error } = await sb.auth.resetPasswordForEmail(email, {
-      redirectTo: window.location.origin + window.location.pathname
-    });
+    const { error } = await withTimeout(
+      sb.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + window.location.pathname }),
+      15000, 'Reset-link request timed out'
+    );
     if(error){ showError(error.message); return; }
     showSuccess("If an account exists for that email, we've sent a link to reset your password. Check your inbox.");
   }catch(e){
@@ -305,7 +325,10 @@ async function doSetNewPassword(){
   const btn = document.getElementById('resetBtn');
   setBusy(btn, true, 'Set new password');
   try{
-    const { error } = await sb.auth.updateUser({ password: pw });
+    const { error } = await withTimeout(
+      sb.auth.updateUser({ password: pw }),
+      15000, 'Password update timed out'
+    );
     if(error){ showError(error.message); return; }
     // Clear the recovery token from the URL so refreshing this page doesn't re-trigger the reset view.
     history.replaceState(null, '', window.location.pathname);
