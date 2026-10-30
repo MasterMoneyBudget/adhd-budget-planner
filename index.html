@@ -162,7 +162,7 @@ const authStorage = {
   setItem: (key, value)=>{ try{ if(isTrustedDevice()) localStorage.setItem(key, value); else sessionStorage.setItem(key, value); }catch(e){} },
   removeItem: (key)=>{ try{ localStorage.removeItem(key); sessionStorage.removeItem(key); }catch(e){} },
 };
-const sb = isConfigured ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+const sb = (isConfigured && window.supabase) ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { storage: authStorage, persistSession: true, autoRefreshToken: true }
 }) : null;
 
@@ -227,10 +227,18 @@ async function doSignin(){
   setTrustedDevice(document.getElementById('signinTrustCheck').checked);
   const btn = document.getElementById('signinBtn');
   setBusy(btn, true, 'Sign in');
-  const { error } = await sb.auth.signInWithPassword({ email, password: pw });
-  setBusy(btn, false, 'Sign in');
-  if(error){ showError(error.message); return; }
-  goToPlanner();
+  try{
+    const { error } = await sb.auth.signInWithPassword({ email, password: pw });
+    if(error){ showError(error.message); return; }
+    goToPlanner();
+  }catch(e){
+    // An unexpected failure here (a network hiccup, a timeout, anything other
+    // than a normal "wrong password" rejection) used to leave the button stuck
+    // on "Please wait…" forever with no feedback at all. Always show something.
+    showError("Something went wrong signing you in. Please check your connection and try again.");
+  }finally{
+    setBusy(btn, false, 'Sign in');
+  }
 }
 
 async function doCreate(){
@@ -245,18 +253,23 @@ async function doCreate(){
   setTrustedDevice(document.getElementById('createTrustCheck').checked);
   const btn = document.getElementById('createBtn');
   setBusy(btn, true, 'Create account');
-  const { data, error } = await sb.auth.signUp({ email, password: pw });
-  setBusy(btn, false, 'Create account');
-  if(error){ showError(error.message); return; }
+  try{
+    const { data, error } = await sb.auth.signUp({ email, password: pw });
+    if(error){ showError(error.message); return; }
 
-  if(data.session){
-    // Email confirmation is off in this project — signed in immediately.
-    goToPlanner();
-  } else {
-    // Email confirmation is on — Supabase sent a confirmation link.
-    showSuccess("Almost there — check your email for a confirmation link, then come back here and sign in.");
-    showSigninView();
-    document.getElementById('signinEmail').value = email;
+    if(data.session){
+      // Email confirmation is off in this project — signed in immediately.
+      goToPlanner();
+    } else {
+      // Email confirmation is on — Supabase sent a confirmation link.
+      showSuccess("Almost there — check your email for a confirmation link, then come back here and sign in.");
+      showSigninView();
+      document.getElementById('signinEmail').value = email;
+    }
+  }catch(e){
+    showError("Something went wrong creating your account. Please check your connection and try again.");
+  }finally{
+    setBusy(btn, false, 'Create account');
   }
 }
 
@@ -271,12 +284,17 @@ async function doForgotPassword(){
   if(!email){ showError('Enter your email.'); return; }
   const btn = document.getElementById('forgotBtn');
   setBusy(btn, true, 'Send reset link');
-  const { error } = await sb.auth.resetPasswordForEmail(email, {
-    redirectTo: window.location.origin + window.location.pathname
-  });
-  setBusy(btn, false, 'Send reset link');
-  if(error){ showError(error.message); return; }
-  showSuccess("If an account exists for that email, we've sent a link to reset your password. Check your inbox.");
+  try{
+    const { error } = await sb.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin + window.location.pathname
+    });
+    if(error){ showError(error.message); return; }
+    showSuccess("If an account exists for that email, we've sent a link to reset your password. Check your inbox.");
+  }catch(e){
+    showError("Something went wrong sending that email. Please check your connection and try again.");
+  }finally{
+    setBusy(btn, false, 'Send reset link');
+  }
 }
 async function doSetNewPassword(){
   clearMessages();
@@ -286,12 +304,17 @@ async function doSetNewPassword(){
   if(pw !== pw2){ showError("Those passwords don't match."); return; }
   const btn = document.getElementById('resetBtn');
   setBusy(btn, true, 'Set new password');
-  const { error } = await sb.auth.updateUser({ password: pw });
-  setBusy(btn, false, 'Set new password');
-  if(error){ showError(error.message); return; }
-  // Clear the recovery token from the URL so refreshing this page doesn't re-trigger the reset view.
-  history.replaceState(null, '', window.location.pathname);
-  goToPlanner();
+  try{
+    const { error } = await sb.auth.updateUser({ password: pw });
+    if(error){ showError(error.message); return; }
+    // Clear the recovery token from the URL so refreshing this page doesn't re-trigger the reset view.
+    history.replaceState(null, '', window.location.pathname);
+    goToPlanner();
+  }catch(e){
+    showError("Something went wrong setting your new password. Please check your connection and try again.");
+  }finally{
+    setBusy(btn, false, 'Set new password');
+  }
 }
 document.getElementById('forgotBtn').addEventListener('click', doForgotPassword);
 document.getElementById('resetBtn').addEventListener('click', doSetNewPassword);
@@ -306,6 +329,18 @@ function isRecoveryFlow(){
 async function bootstrap(){
   if(!isConfigured){
     document.getElementById('configWarning').classList.add('show');
+    return;
+  }
+  if(!window.supabase){
+    // The Supabase library didn't load (slow/blocked network) — show a clear
+    // retry instead of guessing at sign-in status, which is what can cause
+    // this page and the planner to bounce back and forth at each other.
+    titleEl.textContent = 'Connection problem';
+    subEl.textContent = "Couldn't load the sign-in service — check your connection and try again.";
+    hideAllForms();
+    showError('');
+    document.getElementById('loginError').innerHTML = '<button class="login-btn" onclick="location.reload()" style="margin-top:4px;">Try again</button>';
+    document.getElementById('loginError').classList.add('show');
     return;
   }
   if(isRecoveryFlow()){
