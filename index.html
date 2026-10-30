@@ -371,13 +371,21 @@ async function bootstrap(){
     return;
   }
   // If already signed in on this device/browser, skip straight to the planner.
-  const { data } = await sb.auth.getSession();
-  if(data && data.session){
-    titleEl.textContent = 'Signing you in…';
-    subEl.textContent = "You're already signed in — taking you to your planner.";
-    hideAllForms();
-    goToPlanner();
-    return;
+  // This page can be landed on right after the planner bounced back here
+  // because IT couldn't see the session yet either — so give this check the
+  // same patience, rather than giving up on one look and showing a blank
+  // sign-in form for a session that's about to become visible any moment.
+  const delays = [300, 500, 800, 1000, 1200, 1500, 1500, 1500];
+  for(let attempt=0; attempt<=delays.length; attempt++){
+    const { data } = await sb.auth.getSession();
+    if(data && data.session){
+      titleEl.textContent = 'Signing you in…';
+      subEl.textContent = "You're already signed in — taking you to your planner.";
+      hideAllForms();
+      goToPlanner();
+      return;
+    }
+    if(attempt<delays.length) await new Promise(r=>setTimeout(r, delays[attempt]));
   }
   showSigninView();
 }
