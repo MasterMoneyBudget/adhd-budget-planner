@@ -3605,15 +3605,17 @@ async function requireSignIn(){
   // locally-only, same as before this feature existed.
   if(!supabaseConfigured) return true;
   // A session that was JUST created on the login page a moment ago can take
-  // a brief moment to actually be visible here, on this page's own freshly
+  // a little while to actually be visible here, on this page's own freshly
   // created Supabase client — checking once immediately after signing in can
   // lose that race and see nothing yet, bouncing straight back to login even
-  // though sign-in genuinely succeeded. Retry briefly before concluding
-  // there's truly no session, rather than giving up after a single check.
-  for(let attempt=0; attempt<4; attempt++){
+  // though sign-in genuinely succeeded. Retry for several seconds, with
+  // increasing delays, before concluding there's truly no session — a
+  // shorter window risks giving up right as the session is about to appear.
+  const delays = [300, 500, 800, 1000, 1200, 1500, 1500, 1500]; // ~8s total
+  for(let attempt=0; attempt<=delays.length; attempt++){
     const session = await getSupabaseSession();
     if(session) return true;
-    if(attempt<3) await new Promise(r=>setTimeout(r, 400));
+    if(attempt<delays.length) await new Promise(r=>setTimeout(r, delays[attempt]));
   }
   window.location.href = LOGIN_URL;
   return false;
