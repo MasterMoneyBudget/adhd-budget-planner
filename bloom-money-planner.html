@@ -2193,6 +2193,7 @@ function openDayModal(key){
         <option value="monthly">Monthly</option>
       </select>
     </div>
+    <div id="dayEventError" style="display:none;background:#FAE6EA;color:#C9576D;font-size:12.5px;font-weight:700;padding:8px 12px;border-radius:8px;margin-bottom:10px;"></div>
     <div class="modal-actions">
       <button class="btn ghost" id="closeDayModal">Close</button>
       ${editing ? '<button class="btn ghost" id="cancelEditEvent">Cancel edit</button>' : ''}
@@ -2248,7 +2249,14 @@ function openDayModal(key){
     m.querySelector('#addDayEvent').addEventListener('click',()=>{
       const type=typeSel.value;
       const lbl=m.querySelector('#dayEventLabel').value.trim();
-      if(!lbl) return;
+      const errEl = m.querySelector('#dayEventError');
+      if(!lbl){
+        errEl.textContent = "Enter what this is for — e.g. \"Rent due\" or \"Paycheck\" — before adding it.";
+        errEl.style.display = '';
+        m.querySelector('#dayEventLabel').focus();
+        return;
+      }
+      errEl.style.display = 'none';
       const amount=parseFloat(m.querySelector('#dayEventAmount').value)||0;
       const flowTo=flowSel.value;
 
@@ -3596,12 +3604,19 @@ async function requireSignIn(){
   // send people to a non-functional login screen — let the planner run
   // locally-only, same as before this feature existed.
   if(!supabaseConfigured) return true;
-  const session = await getSupabaseSession();
-  if(!session){
-    window.location.href = LOGIN_URL;
-    return false;
+  // A session that was JUST created on the login page a moment ago can take
+  // a brief moment to actually be visible here, on this page's own freshly
+  // created Supabase client — checking once immediately after signing in can
+  // lose that race and see nothing yet, bouncing straight back to login even
+  // though sign-in genuinely succeeded. Retry briefly before concluding
+  // there's truly no session, rather than giving up after a single check.
+  for(let attempt=0; attempt<4; attempt++){
+    const session = await getSupabaseSession();
+    if(session) return true;
+    if(attempt<3) await new Promise(r=>setTimeout(r, 400));
   }
-  return true;
+  window.location.href = LOGIN_URL;
+  return false;
 }
 async function checkSyncAndLoad(){
   await loadState();
