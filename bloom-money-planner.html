@@ -1123,7 +1123,7 @@ async function supabaseWrite(value, opts){
   opts = opts||{};
   const session = await getSupabaseSession();
   if(!session){ lastSyncError = true; lastSyncErrorMessage = "your sign-in couldn't be confirmed"; return 'error'; }
-  const obj = JSON.parse(value);
+  let obj = JSON.parse(value);
   const count = countEntries(obj);
   // Would this save wipe out most of what's there? Only allow that when the
   // person asked for it (erase, restore a backup, archive) or confirms it.
@@ -1132,30 +1132,40 @@ async function supabaseWrite(value, opts){
   }
   for(let attempt=0; attempt<3; attempt++){
     try{
-      // What's on the server right now?
       const cur = await sb.from('planner_data').select('rev:data->_rev').eq('user_id', session.user.id).maybeSingle();
       if(cur.error) throw cur.error;
-      if(!cur.data){
+      let serverRev = cur.data ? (Number(cur.data.rev)||0) : null;
+      if(serverRev===null){
         // Nothing visible for this account: only ever add a record, never replace one.
         obj._rev = 1;
+        noteSendingRev(1);
         const ins = await sb.from('planner_data')
           .upsert({ user_id: session.user.id, data: obj }, { onConflict:'user_id', ignoreDuplicates:true })
           .select('user_id');
         if(ins.error) throw ins.error;
-        if(!ins.data || !ins.data.length) return 'conflict'; // a record exists that this page never read
-        lastServerRev = 1;
-      } else {
-        const serverRev = Number(cur.data.rev)||0;
-        if(serverRev > lastServerRev && !opts.force) return 'conflict'; // changed on another device/tab
-        obj._rev = Math.max(serverRev, lastServerRev) + 1;
-        const up = await sb.from('planner_data').upsert({ user_id: session.user.id, data: obj }, { onConflict:'user_id' });
-        if(up.error) throw up.error;
-        lastServerRev = obj._rev;
+        if(ins.data && ins.data.length) return finishWrite(obj, false);
+        serverRev = Infinity; // a record exists that this page never read: combine with it below
       }
-      state._rev = lastServerRev;
-      lastSyncedCount = count;
-      lastSyncError = false; lastSyncErrorMessage = '';
-      return 'saved';
+      let merged = false;
+      if(serverRev > lastServerRev){
+        // Another device saved since this page last synced. Combine both
+        // versions so nothing from either device is lost.
+        const full = await sb.from('planner_data').select('data').eq('user_id', session.user.id).maybeSingle();
+        if(full.error) throw full.error;
+        // Only ever combine with a version actually read from the account. If
+        // the account's planner can't be seen (the problem behind the earlier
+        // data loss), save nothing rather than risk replacing it.
+        if(!full.data || !full.data.data) return 'conflict';
+        const theirs = full.data.data;
+        serverRev = Number(theirs._rev)||0;
+        obj = combineWithAccount(lastSyncedBase, obj, theirs);
+        merged = true;
+      }
+      obj._rev = Math.max(serverRev, lastServerRev) + 1;
+      noteSendingRev(obj._rev);
+      const up = await sb.from('planner_data').upsert({ user_id: session.user.id, data: obj }, { onConflict:'user_id' });
+      if(up.error) throw up.error;
+      return finishWrite(obj, merged);
     }catch(e){
       lastSyncErrorMessage = e.message || JSON.stringify(e);
       console.error('Supabase write failed:', e);
@@ -1164,6 +1174,15 @@ async function supabaseWrite(value, opts){
   }
   lastSyncError = true;
   return 'error';
+}
+function finishWrite(obj, merged){
+  lastServerRev = obj._rev;
+  state._rev = lastServerRev;
+  lastSyncedCount = countEntries(obj);
+  rememberBase(obj);
+  lastSyncError = false; lastSyncErrorMessage = '';
+  if(merged){ lastMergedResult = obj; return 'merged'; }
+  return 'saved';
 }
 
 /* ============ STORAGE (Supabase first, then Claude's storage, then this browser) ============
@@ -1198,12 +1217,122 @@ function writeLocalCopy(value){
   }catch(e){ /* localStorage unavailable (e.g. private mode) */ }
 }
 
+/* ---- Keeping every device up to date ----
+   Each change is saved on this device and sent to the account immediately.
+   If the page closes before the send finishes, a note on this device says so
+   and the change is sent on the next visit.
+   When two devices have changed the planner, the versions are combined rather
+   than one replacing the other: something added on one device and something
+   added on another both stay, and where both changed the very same thing,
+   the most recent change wins. To combine them, the planner keeps a copy of
+   the version it last synced ("base"): comparing each side to it shows who
+   changed what. */
+const LOCAL_UNSYNCED_KEY = LOCAL_PREFIX+'bloomData_unsynced';
+const LOCAL_BASE_KEY = LOCAL_PREFIX+'bloomData_base';
+let lastSyncedBase = null;         // the version this page last read from / wrote to the account
+let lastMergedResult = null;
+function markUnsynced(){
+  if(!supabaseConfigured || !cachedSupabaseSession) return;
+  try{ localStorage.setItem(LOCAL_UNSYNCED_KEY, JSON.stringify({owner:cachedSupabaseSession.user.id, baseRev:lastServerRev, ownRevs:[]})); }catch(e){}
+}
+function noteSendingRev(rev){
+  try{
+    const m = JSON.parse(localStorage.getItem(LOCAL_UNSYNCED_KEY)||'null');
+    if(!m) return;
+    m.ownRevs = (m.ownRevs||[]).concat(rev).slice(-20);
+    localStorage.setItem(LOCAL_UNSYNCED_KEY, JSON.stringify(m));
+  }catch(e){}
+}
+function clearUnsynced(){ try{ localStorage.removeItem(LOCAL_UNSYNCED_KEY); }catch(e){} }
+function readUnsynced(userId){
+  try{
+    const m = JSON.parse(localStorage.getItem(LOCAL_UNSYNCED_KEY)||'null');
+    return (m && userId && m.owner===userId) ? m : null;
+  }catch(e){ return null; }
+}
+function rememberBase(obj){
+  lastSyncedBase = obj ? JSON.parse(JSON.stringify(obj)) : null;
+  if(!supabaseConfigured) return;
+  try{ localStorage.setItem(LOCAL_BASE_KEY, JSON.stringify(obj||{})); }catch(e){}
+}
+function readBaseCopy(){ try{ return JSON.parse(localStorage.getItem(LOCAL_BASE_KEY)||'null'); }catch(e){ return null; } }
+/* Same content, ignoring key order and bookkeeping fields. */
+function stableStringify(v){
+  if(Array.isArray(v)) return '['+v.map(stableStringify).join(',')+']';
+  if(v && typeof v==='object') return '{'+Object.keys(v).filter(k=>k!=='_rev' && k!=='_savedAt' && v[k]!==undefined).sort().map(k=>JSON.stringify(k)+':'+stableStringify(v[k])).join(',')+'}';
+  return JSON.stringify(v===undefined ? null : v);
+}
+/* Combine two versions that both started from `base`. Lists of things with
+   ids (entries, events, debts, goals...) are combined item by item; anything
+   else that both sides changed goes to the newer one. */
+function mergeVersions(base, ours, theirs, oursNewer){
+  const eq = (a,b)=>stableStringify(a)===stableStringify(b);
+  if(eq(ours, theirs)) return ours;
+  if(base!==undefined && eq(ours, base)) return theirs;
+  if(base!==undefined && eq(theirs, base)) return ours;
+  const isObj = (v)=>v && typeof v==='object' && !Array.isArray(v);
+  const idList = (a)=>Array.isArray(a) && a.every(x=>isObj(x) && x.id!=null);
+  if(idList(ours) && idList(theirs) && (base==null || idList(base))){
+    const b = new Map((base||[]).map(x=>[x.id,x])), o = new Map(ours.map(x=>[x.id,x])), t = new Map(theirs.map(x=>[x.id,x]));
+    const ids = ours.map(x=>x.id).concat(theirs.filter(x=>!o.has(x.id)).map(x=>x.id));
+    const out = [];
+    ids.forEach(id=>{
+      if(o.has(id) && t.has(id)) out.push(mergeVersions(b.get(id), o.get(id), t.get(id), oursNewer));
+      else {
+        const only = o.has(id) ? o.get(id) : t.get(id);
+        // Added on one side -> keep. Deleted on one side -> drop, unless the other side changed it since.
+        if(!b.has(id) || !eq(only, b.get(id))) out.push(only);
+      }
+    });
+    return out;
+  }
+  if(isObj(ours) && isObj(theirs)){
+    const bb = isObj(base) ? base : {};
+    const out = {};
+    new Set(Object.keys(ours).concat(Object.keys(theirs))).forEach(k=>{
+      const inO = k in ours, inT = k in theirs;
+      if(inO && inT) out[k] = mergeVersions(bb[k], ours[k], theirs[k], oursNewer);
+      else {
+        const only = inO ? ours[k] : theirs[k];
+        if(!(k in bb) || !eq(only, bb[k])) out[k] = only;
+      }
+    });
+    return out;
+  }
+  return oursNewer ? ours : theirs;
+}
+function combineWithAccount(base, ours, theirs){
+  const oursNewer = (Number(ours && ours._savedAt)||0) >= (Number(theirs && theirs._savedAt)||0);
+  const merged = mergeVersions(base||{}, ours||{}, theirs||{}, oursNewer);
+  merged._savedAt = Math.max(Number(ours && ours._savedAt)||0, Number(theirs && theirs._savedAt)||0);
+  return merged;
+}
+let recoveredFromDevice = false;   // this visit is sending changes from last time
+
 /* Where the saved planner comes from. {ok, source, value, seed} */
 async function readSavedPlanner(){
   if(supabaseConfigured){
     const res = await supabaseRead();
     if(!res.ok) return {ok:false};
-    if(res.exists) return {ok:true, source:'supabase', value: res.data ? JSON.stringify(res.data) : null};
+    if(res.exists){
+      const server = res.data || {};
+      const serverRev = Number(server._rev)||0;
+      const userId = cachedSupabaseSession && cachedSupabaseSession.user.id;
+      const pending = readUnsynced(userId);
+      const local = pending ? readLocalCopyFor(userId) : null;
+      if(pending && local){
+        let localObj = null;
+        try{ localObj = JSON.parse(local); }catch(e){}
+        if(localObj && stableStringify(localObj)!==stableStringify(server)){
+          // This device has changes the account never got.
+          const builtOnThis = [pending.baseRev].concat(pending.ownRevs||[]).includes(serverRev);
+          const value = builtOnThis ? local : JSON.stringify(combineWithAccount(readBaseCopy(), localObj, server));
+          return {ok:true, source:'supabase', value, serverData:server, serverRev, recovered:true};
+        }
+        clearUnsynced();
+      } else if(pending){ clearUnsynced(); }
+      return {ok:true, source:'supabase', value: res.data ? JSON.stringify(res.data) : null, serverData:server, serverRev};
+    }
     // Supabase answered: this account has nothing saved yet. If this device has
     // a copy from before sync was set up, bring it along (it's only ever added,
     // never used to replace anything).
@@ -1245,10 +1374,10 @@ function saveState(opts){
     showSyncBanner('load-failed');
     return;
   }
-  clearTimeout(saveTimer);
+  state._savedAt = Date.now();     // when this change was made, so the newest change always wins
   pendingSaveValue = JSON.stringify(state);
   if(opts && opts.allowShrink) pendingAllowShrink = true;
-  saveTimer=setTimeout(()=>{ handOffPendingSave(); }, 250);
+  handOffPendingSave();             // saved on this device and sent to the account right away
 }
 function handOffPendingSave(){
   clearTimeout(saveTimer);
@@ -1256,6 +1385,7 @@ function handOffPendingSave(){
   queuedWrite = {value:pendingSaveValue, allowShrink:pendingAllowShrink || (queuedWrite && queuedWrite.allowShrink)};
   pendingSaveValue = null; pendingAllowShrink = false;
   writeLocalCopy(queuedWrite.value); // this device's copy, right away
+  markUnsynced();                    // ...and a note that the account doesn't have it yet
   if(!writerRunning) writerRunning = runWriter().finally(()=>{ writerRunning=null; });
   return writerRunning;
 }
@@ -1270,15 +1400,113 @@ async function runWriter(){
     if(result==='conflict'){ syncHalted = true; heldWrite = job; showSyncBanner('conflict'); }
     else if(result==='held'){ syncHalted = true; heldWrite = job; showSyncBanner('held'); }
     else if(result==='error'){ showSyncBanner('save-failed'); }
-    else hideSyncBanner();
+    else {
+      hideSyncBanner();
+      if(result==='merged'){
+        // Show what came from the other device too, keeping anything changed
+        // here since this save was sent.
+        const combined = mergeVersions(JSON.parse(job.value), JSON.parse(JSON.stringify(state)), lastMergedResult, true);
+        const hasNewerHere = stableStringify(combined)!==stableStringify(lastMergedResult);
+        applyVersionToPage(combined);
+        if(hasNewerHere){ queuedWrite = null; pendingSaveValue = null; saveState(); continue; }
+      }
+      if(queuedWrite || pendingSaveValue!==null) markUnsynced(); else clearUnsynced();
+    }
   }
 }
+/* Put a version on screen without losing the person's place. */
+function applyVersionToPage(data){
+  const y = window.scrollY;
+  applySavedPlanner(JSON.parse(JSON.stringify(data)));
+  invalidateEventIndex();
+  applyTheme(); updateBrand(); buildMonthsDrawer(); renderSidebarFooter();
+  goTo(currentPanel);
+  window.scrollTo(0, y);
+}
+/* ---- Pick up changes from other devices ----
+   While the planner is open it checks the account when the person comes back
+   to it and every 20 seconds, and shows any newer version straight away. */
+let checkingForNewer = false;
+async function checkForNewerVersion(){
+  if(!supabaseConfigured || !loadOk || syncHalted || checkingForNewer) return;
+  if(document.visibilityState==='hidden') return;
+  if(pendingSaveValue!==null || queuedWrite || writerRunning) return;     // our own change is on its way; the save combines them
+  if(overlay.classList.contains('open')) return;                          // don't change things under an open form
+  const ae = document.activeElement;
+  if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return;          // or while someone's typing
+  checkingForNewer = true;
+  try{
+    const session = await getSupabaseSession();
+    if(!session) return;
+    const cur = await sb.from('planner_data').select('rev:data->_rev').eq('user_id', session.user.id).maybeSingle();
+    if(cur.error || !cur.data || (Number(cur.data.rev)||0) <= lastServerRev) return;
+    const full = await sb.from('planner_data').select('data').eq('user_id', session.user.id).maybeSingle();
+    if(full.error || !full.data || !full.data.data) return;
+    if(pendingSaveValue!==null || queuedWrite || writerRunning || overlay.classList.contains('open')) return; // something changed meanwhile
+    const server = full.data.data;
+    lastServerRev = Number(server._rev)||0;
+    lastSyncedCount = countEntries(server);
+    rememberBase(server);
+    applyVersionToPage(server);
+  }catch(e){ /* try again next time */ }
+  finally{ checkingForNewer = false; }
+}
 let heldWrite = null; // the save waiting on the person after a conflict or a "wipe most of it" check
-/* Call this before signing out or navigating away on purpose, so a save that's
-   still sitting in the 250ms debounce window doesn't get lost. */
+/* Call this before signing out or navigating away on purpose, so a save
+   that's still being sent finishes first. */
 async function flushSave(){
   await handOffPendingSave();
   if(writerRunning) await writerRunning;
+}
+/* Turns a saved planner into what's on screen (used when opening the
+   planner and when a newer version arrives from another device). */
+function applySavedPlanner(parsed){
+  state = Object.assign({}, state, parsed);
+  state.settings = Object.assign({name:'',theme:'blush',customColor:null,darkMode:false,currency:'USD',startingBalance:0, rolloverEnabled:false}, parsed.settings||{});
+  if(!parsed.months) state.months = state.months;
+  else{
+    for(let i=0;i<12;i++){
+      const m = state.months[i] || {};
+      state.months[i] = {
+        income: m.income||[],
+        bills: m.bills||[],
+        expenses: m.expenses||[],
+        debt: m.debt||[],
+        savings: m.savings||[],
+        notes: m.notes||''
+      };
+    }
+  }
+  state.budget = Object.assign({income:0,debt:0,savings:0}, parsed.budget||{});
+  state.envelopes = (parsed.envelopes && parsed.envelopes.length) ? parsed.envelopes : makeDefaultEnvelopes();
+  state.envelopeSpending = parsed.envelopeSpending || {};
+  state.debtBudgets = parsed.debtBudgets || {};
+  state.debtSpending = parsed.debtSpending || {};
+  state.savingsBudgets = parsed.savingsBudgets || {};
+  state.savingsSpending = parsed.savingsSpending || {};
+  state.monthlyIncomeBudget = parsed.monthlyIncomeBudget || {};
+  // migrate old flat envelopeBudgets ({envId:amount}) to per-month format
+  const rawEnvBudgets = parsed.envelopeBudgets || {};
+  const isOldFlatFormat = Object.values(rawEnvBudgets).some(v=>typeof v === 'number');
+  if(isOldFlatFormat){
+    state.envelopeBudgets = {};
+    for(let i=0;i<12;i++) state.envelopeBudgets[i] = Object.assign({}, rawEnvBudgets);
+  } else {
+    state.envelopeBudgets = rawEnvBudgets;
+  }
+  if(!state.monthlyIncomeBudget || !Object.keys(state.monthlyIncomeBudget).length){
+    // migrate old single global income budget to every month
+    if(parsed.budget && parsed.budget.income){
+      state.monthlyIncomeBudget = {};
+      for(let i=0;i<12;i++) state.monthlyIncomeBudget[i] = parsed.budget.income;
+    }
+  }
+  state.events = parsed.events||{};
+  state.funds = parsed.funds||[];
+  state.debts = parsed.debts||[];
+  state.goals = parsed.goals||[];
+  state.debtOrder = parsed.debtOrder||'avalanche';
+  migrateMonthKeysToYear();
 }
 async function loadState(){
   loadOk = false;
@@ -1287,53 +1515,7 @@ async function loadState(){
   if(!res.ok) return;
   if(res.value){
     try{
-      const parsed = JSON.parse(res.value);
-      state = Object.assign({}, state, parsed);
-      state.settings = Object.assign({name:'',theme:'blush',customColor:null,darkMode:false,currency:'USD',startingBalance:0, rolloverEnabled:false}, parsed.settings||{});
-      if(!parsed.months) state.months = state.months;
-      else{
-        for(let i=0;i<12;i++){
-          const m = state.months[i] || {};
-          state.months[i] = {
-            income: m.income||[],
-            bills: m.bills||[],
-            expenses: m.expenses||[],
-            debt: m.debt||[],
-            savings: m.savings||[],
-            notes: m.notes||''
-          };
-        }
-      }
-      state.budget = Object.assign({income:0,debt:0,savings:0}, parsed.budget||{});
-      state.envelopes = (parsed.envelopes && parsed.envelopes.length) ? parsed.envelopes : makeDefaultEnvelopes();
-      state.envelopeSpending = parsed.envelopeSpending || {};
-      state.debtBudgets = parsed.debtBudgets || {};
-      state.debtSpending = parsed.debtSpending || {};
-      state.savingsBudgets = parsed.savingsBudgets || {};
-      state.savingsSpending = parsed.savingsSpending || {};
-      state.monthlyIncomeBudget = parsed.monthlyIncomeBudget || {};
-      // migrate old flat envelopeBudgets ({envId:amount}) to per-month format
-      const rawEnvBudgets = parsed.envelopeBudgets || {};
-      const isOldFlatFormat = Object.values(rawEnvBudgets).some(v=>typeof v === 'number');
-      if(isOldFlatFormat){
-        state.envelopeBudgets = {};
-        for(let i=0;i<12;i++) state.envelopeBudgets[i] = Object.assign({}, rawEnvBudgets);
-      } else {
-        state.envelopeBudgets = rawEnvBudgets;
-      }
-      if(!state.monthlyIncomeBudget || !Object.keys(state.monthlyIncomeBudget).length){
-        // migrate old single global income budget to every month
-        if(parsed.budget && parsed.budget.income){
-          state.monthlyIncomeBudget = {};
-          for(let i=0;i<12;i++) state.monthlyIncomeBudget[i] = parsed.budget.income;
-        }
-      }
-      state.events = parsed.events||{};
-      state.funds = parsed.funds||[];
-      state.debts = parsed.debts||[];
-      state.goals = parsed.goals||[];
-      state.debtOrder = parsed.debtOrder||'avalanche';
-      migrateMonthKeysToYear();
+      applySavedPlanner(JSON.parse(res.value));
     }catch(e){
       // The saved planner is there but couldn't be read. Keep saving paused so
       // the half-loaded screen can never replace it.
@@ -1344,9 +1526,11 @@ async function loadState(){
       return;
     }
   }
+  recoveredFromDevice = !!res.recovered;
   if(res.source==='supabase'){
-    lastServerRev = Number(state._rev)||0;
-    lastSyncedCount = countEntries(state);
+    lastServerRev = res.serverRev||0;
+    lastSyncedCount = countEntries(res.serverData);
+    rememberBase(res.serverData);
   } else {
     lastServerRev = 0;
     lastSyncedCount = 0;
@@ -4015,9 +4199,16 @@ document.getElementById('budgetIncome').addEventListener('input',(e)=>{
 // is still sitting in the debounce window, write it synchronously to
 // localStorage right away (the async Supabase/window.storage writes may not
 // finish in time during unload, but the local copy will be safe either way).
-window.addEventListener('pagehide', ()=>{
-  if(pendingSaveValue!==null) writeLocalCopy(pendingSaveValue);
+function sendWaitingChangeNow(){
+  if(pendingSaveValue!==null) handOffPendingSave();
+}
+window.addEventListener('pagehide', sendWaitingChangeNow);
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='hidden') sendWaitingChangeNow();
+  else checkForNewerVersion();
 });
+window.addEventListener('focus', ()=>checkForNewerVersion());
+setInterval(()=>checkForNewerVersion(), 20000);
 
 /* ============ SYNC BANNER ============
    One banner at the top for anything that stops a save, with a clear way out. */
@@ -4055,7 +4246,8 @@ async function retryHeldSave(opts){
   // Send the newest version (including anything changed since the save was held).
   syncHalted = false; heldWrite = null;
   const result = await supabaseWrite(JSON.stringify(state), opts);
-  if(result==='saved'){ hideSyncBanner(); writeLocalCopy(JSON.stringify(state)); }
+  if(result==='merged'){ hideSyncBanner(); applyVersionToPage(lastMergedResult); writeLocalCopy(JSON.stringify(state)); clearUnsynced(); }
+  else if(result==='saved'){ hideSyncBanner(); writeLocalCopy(JSON.stringify(state)); clearUnsynced(); }
   else if(result==='conflict'){ syncHalted = true; showSyncBanner('conflict'); }
   else if(result==='held'){ syncHalted = true; showSyncBanner('held'); }
   else showSyncBanner('save-failed');
@@ -4099,6 +4291,12 @@ async function checkSyncAndLoad(){
   await loadState();
   if(!loadOk){ showSyncBanner('load-failed'); return; }
   hideSyncBanner();
+  if(recoveredFromDevice){
+    // Changes from last time never reached the account: send them now.
+    saveState();
+    await flushSave();
+    return;
+  }
   // Supabase confirmed this account has nothing saved yet: create its record
   // now, so other devices have something to sync from. This can only ever add
   // a record — if one turns out to exist after all, it's left untouched and
